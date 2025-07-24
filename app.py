@@ -8,152 +8,186 @@ import io
 import threading
 import queue
 import time
+import pickle
 from datetime import datetime
+from pathlib import Path
 
-# --- Configuration ---
-# Set your Google API Key (replace with your actual key or ensure it's in environment variables)
-try:
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-except KeyError:
-    st.error("Error: GOOGLE_API_KEY environment variable not set.")
-    st.error("Please set your API key as an environment variable.")
-    st.stop()
+# Page configuration
+st.set_page_config(
+    page_title="Coda AI Assistant",
+    page_icon="📝",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Initialize the Gemini model for function calling
-# 'gemini-pro' is generally good for text and function calling. 'gemini-2.5-pro' is a valid choice if available.
-model = genai.GenerativeModel('gemini-2.5-pro')
+# Custom CSS to improve chat layout
+st.markdown("""
+<style>
+    /* Hide the main menu and footer */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    /* Improve chat message styling */
+    .stChatMessage {
+        margin-bottom: 1rem;
+    }
+    
+    /* Make chat input more prominent */
+    .stChatInput > div > div > div {
+        background-color: #f0f2f6;
+        border-radius: 10px;
+    }
+    
+    /* Improve sidebar styling */
+    .css-1d391kg {
+        padding-top: 1rem;
+    }
+    
+    /* Better spacing for chat container */
+    .main .block-container {
+        padding-bottom: 2rem;
+    }
+    
+    /* Style for welcome message */
+    .welcome-message {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- MCP Server Management ---
-# Global variable to hold the MCP server process
-if 'mcp_server_process' not in st.session_state:
+# Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chat_session" not in st.session_state:
+    st.session_state.chat_session = None
+if "mcp_server_process" not in st.session_state:
     st.session_state.mcp_server_process = None
-if 'stdout_queue' not in st.session_state:
+if "stdout_queue" not in st.session_state:
     st.session_state.stdout_queue = queue.Queue()
-if 'stop_stdout_reader_event' not in st.session_state:
+if "stop_stdout_reader_event" not in st.session_state:
     st.session_state.stop_stdout_reader_event = threading.Event()
+if "model" not in st.session_state:
+    st.session_state.model = None
+if "session_name" not in st.session_state:
+    st.session_state.session_name = f"Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+# Create sessions directory
+SESSIONS_DIR = Path("chat_sessions")
+SESSIONS_DIR.mkdir(exist_ok=True)
 
 def enqueue_output(out, queue, stop_event):
-    """Reads lines from a stream and puts them into a queue."""
-    for line in iter(out.readline, ''):
-        if stop_event.is_set():
-            break
-        queue.put(line)
-    out.close()
-def start_mcp_server():
-    """Starts the coda-mcp server as a subprocess and sets up stdout reading."""
-    print("Starting coda-mcp server...")
-
     try:
-        # Launch the MCP server using npx
-        # CODA_API_KEY is injected from environment variables
-        mcp_server_process = subprocess.Popen(
+        for line in iter(out.readline, ''):
+            if stop_event.is_set():
+                break
+            queue.put(line)
+    except Exception as e:
+        st.error(f"Error in stdout reader: {e}")
+    finally:
+        try:
+            out.close()
+        except:
+            pass
+
+def start_mcp_server():
+    if st.session_state.mcp_server_process is not None:
+        return True
+        
+    try:
+        env = os.environ.copy()
+        if "API_KEY" not in env and "CODA_API_KEY" in env:
+            env["API_KEY"] = env["CODA_API_KEY"]
+        
+        st.session_state.mcp_server_process = subprocess.Popen(
             ["npx", "-y", "coda-mcp@latest"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env={**os.environ, "CODA_API_KEY": os.environ.get("CODA_API_KEY", "")}
+            env=env
         )
 
-        print("coda-mcp server started.")
-
-        # Clear the stop event in case this is a restart
         st.session_state.stop_stdout_reader_event.clear()
-
-        # Start a separate thread to continuously read stdout
         threading.Thread(
-            target=enqueue_output,
-            args=(
-                mcp_server_process.stdout,
-                st.session_state.stdout_queue,
-                st.session_state.stop_stdout_reader_event,
-            ),
+            target=enqueue_output, 
+            args=(st.session_state.mcp_server_process.stdout, st.session_state.stdout_queue, st.session_state.stop_stdout_reader_event), 
             daemon=True
         ).start()
 
-        # Optional: You can start another thread to read stderr for logging/debugging
-
-        # Give the server a second to initialize
-        time.sleep(2)
-
-        # Save the process handle in Streamlit session state
-        st.session_state.mcp_server_process = mcp_server_process
+        time.sleep(3)
         return True
-
     except FileNotFoundError:
         st.error("Error: 'npx' command not found. Make sure Node.js and npm are installed and in your PATH.")
         return False
-
     except Exception as e:
         st.error(f"Error starting coda-mcp server: {e}")
         return False
 
 def stop_mcp_server():
-    """Stops the coda-mcp server subprocess."""
     if st.session_state.mcp_server_process:
-        print("Stopping coda-mcp server...")
-        st.session_state.stop_stdout_reader_event.set() # Signal the reader thread to stop
-        st.session_state.mcp_server_process.terminate() # or .kill() if terminate doesn't work
+        st.session_state.stop_stdout_reader_event.set()
+        st.session_state.mcp_server_process.terminate()
         try:
-            st.session_state.mcp_server_process.wait(timeout=5) # Wait for it to terminate
+            st.session_state.mcp_server_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            print("coda-mcp server did not terminate, killing...")
             st.session_state.mcp_server_process.kill()
             st.session_state.mcp_server_process.wait()
-        print("coda-mcp server stopped.")
     st.session_state.mcp_server_process = None
 
 def execute_mcp_tool(tool_name: str, **kwargs):
-    """
-    Generic function to send an MCP tool call request to the coda-mcp server
-    and receive its response. Renamed from call_mcp_tool to avoid confusion with Gemini's tool calls.
-    """
     if not st.session_state.mcp_server_process or st.session_state.mcp_server_process.poll() is not None:
-        st.warning("MCP server not running or crashed. Attempting to restart...")
         if not start_mcp_server():
             return {"error": "Failed to restart MCP server."}
 
-    request_id = str(time.time_ns()) # Unique ID for the request
+    request_id = str(time.time_ns())
+    clean_kwargs = {k: v for k, v in kwargs.items() if v is not None and v != ""}
 
-    # Construct the MCP tool_call request payload
     mcp_request = {
         "id": request_id,
         "jsonrpc": "2.0",
         "method": "tools/call",
         "params": {
             "name": tool_name,
-            "arguments": kwargs
+            "arguments": clean_kwargs
         }
     }
     request_json = json.dumps(mcp_request) + "\n"
 
     try:
-        # Write the request to stdin of the MCP server
+        while not st.session_state.stdout_queue.empty():
+            try:
+                st.session_state.stdout_queue.get_nowait()
+            except queue.Empty:
+                break
+
         st.session_state.mcp_server_process.stdin.write(request_json)
         st.session_state.mcp_server_process.stdin.flush()
-        print(f"Sent MCP request to {tool_name}: {request_json.strip()}")
 
-        # Read responses from stdout until we find our request_id or timeout
         response_data = None
         start_time = time.time()
-        timeout = 30 # seconds
+        timeout = 45
+        
         while time.time() - start_time < timeout:
             try:
-                line = st.session_state.stdout_queue.get(timeout=1) # Get with a timeout
-                if line.strip():  # Only process non-empty lines
-                    response = json.loads(line.strip())
-                    if response.get("id") == request_id:
-                        response_data = response
-                        break
+                line = st.session_state.stdout_queue.get(timeout=2)
+                line = line.strip()
+                if line:
+                    try:
+                        response = json.loads(line)
+                        if response.get("id") == request_id:
+                            response_data = response
+                            break
+                    except json.JSONDecodeError:
+                        continue
             except queue.Empty:
-                # No response yet, continue waiting
-                pass
-            except json.JSONDecodeError as e:
-                print(f"Warning: Non-JSON output from MCP server: {line.strip()} - Error: {e}")
-                # Continue trying to read more lines
+                continue
             except Exception as e:
-                print(f"Error processing MCP server output: {e}")
+                st.error(f"Error processing MCP server output: {e}")
                 break
 
         if response_data:
@@ -168,486 +202,434 @@ def execute_mcp_tool(tool_name: str, **kwargs):
             else:
                 return {"error": "MCP server response missing 'result' or 'error' key."}
         else:
-            print(f"Timeout or no response for request {request_id} from MCP server.")
-            # Try to read any stderr output for debugging
-            try:
-                # Non-blocking read of stderr
-                if st.session_state.mcp_server_process.stderr.readable():
-                    stderr_data = st.session_state.mcp_server_process.stderr.read()
-                    if stderr_data:
-                        print(f"MCP Server Stderr: {stderr_data}")
-            except Exception as e_stderr:
-                print(f"Error reading stderr: {e_stderr}")
             return {"error": "MCP server did not respond in time or provided invalid output."}
 
     except Exception as e:
-        print(f"Error communicating with MCP server: {e}")
         return {"error": f"Communication error with MCP server: {e}"}
 
-# --- Tool Definitions for Gemini (FunctionDeclarations) ---
-# Removed 'anyOf' as it's not supported directly in the FunctionDeclaration schema.
-# Input validation will now happen in the Python wrapper functions.
-
-coda_list_documents_func = FunctionDeclaration(
-    name="coda_list_documents",
-    description="Lists all documents available to the authenticated user in Coda.io",
-    parameters={
-        "type": "object",
-        "properties": {} # No parameters for this tool
-    }
-)
-
-coda_list_pages_func = FunctionDeclaration(
-    name="coda_list_pages",
-    description="Lists all pages within a Coda document. Requires either documentId or documentName.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
+# Function declarations for Coda tools
+coda_tools_declarations = [
+    FunctionDeclaration(
+        name="coda_list_documents",
+        description="Lists all documents available to the authenticated user in Coda.io.",
+        parameters={"type": "object", "properties": {}, "required": []}
+    ),
+    FunctionDeclaration(
+        name="coda_list_pages",
+        description="Lists all pages within a Coda document.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "docId": {"type": "string", "description": "The unique document ID (preferred)"},
+                "docName": {"type": "string", "description": "The document name (alternative)"}
+            },
+            "required": []
         }
-    }
-)
-
-coda_create_page_func = FunctionDeclaration(
-    name="coda_create_page",
-    description="Creates a new page in a Coda document. Requires a pageName and either documentId or documentName. Optionally, initial markdown content can be provided, and a parentPageId to create a subpage.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"},
-            "pageName": {"type": "string", "description": "The name of the new page"},
-            "content": {"type": "string", "description": "Initial markdown content for the page"},
-            "parentPageId": {"type": "string", "description": "Parent page ID to create a subpage"}
-        },
-        "required": ["pageName"] # pageName is always required
-    }
-)
-
-coda_get_page_content_func = FunctionDeclaration(
-    name="coda_get_page_content",
-    description="Retrieves the content of a Coda page as markdown. Requires either pageId or pageName. If using pageName, you should also provide documentId or documentName for disambiguation.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pageId": {"type": "string", "description": "The page ID"},
-            "pageName": {"type": "string", "description": "The page name"},
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
+    ),
+    FunctionDeclaration(
+        name="coda_create_page",
+        description="Creates a new page in a Coda document.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "docId": {"type": "string", "description": "The unique document ID (required)"},
+                "name": {"type": "string", "description": "The name of the new page"},
+                "content": {"type": "string", "description": "Initial markdown content (optional)"},
+                "parentPageId": {"type": "string", "description": "Parent page ID for subpage (optional)"}
+            },
+            "required": ["docId", "name"]
         }
-    }
-)
-
-coda_replace_page_content_func = FunctionDeclaration(
-    name="coda_replace_page_content",
-    description="Replaces a page's content with new markdown. Requires content and either pageId or pageName. If using pageName, you should also provide documentId or documentName for disambiguation.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pageId": {"type": "string", "description": "The page ID"},
-            "pageName": {"type": "string", "description": "The page name"},
-            "content": {"type": "string", "description": "New markdown content for the page"},
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
-        },
-        "required": ["content"] # Content is always required
-    }
-)
-
-coda_append_page_content_func = FunctionDeclaration(
-    name="coda_append_page_content",
-    description="Adds new markdown content to the end of a Coda page. Requires content and either pageId or pageName. If using pageName, you should also provide documentId or documentName for disambiguation.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pageId": {"type": "string", "description": "The page ID"},
-            "pageName": {"type": "string", "description": "The page name"},
-            "content": {"type": "string", "description": "Markdown content to append"},
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
-        },
-        "required": ["content"] # Content is always required
-    }
-)
-
-coda_duplicate_page_func = FunctionDeclaration(
-    name="coda_duplicate_page",
-    description="Creates a copy of an existing Coda page with a new name. Requires newPageName and either pageId or pageName. If using pageName, you should also provide documentId or documentName for disambiguation.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pageId": {"type": "string", "description": "The page ID"},
-            "pageName": {"type": "string", "description": "The page name"},
-            "newPageName": {"type": "string", "description": "Name for the duplicated page"},
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
-        },
-        "required": ["newPageName"] # newPageName is always required
-    }
-)
-
-coda_rename_page_func = FunctionDeclaration(
-    name="coda_rename_page",
-    description="Renames an existing Coda page. Requires newName and either pageId or pageName. If using pageName, you should also provide documentId or documentName for disambiguation.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pageId": {"type": "string", "description": "The page ID"},
-            "pageName": {"type": "string", "description": "The current page name"},
-            "newName": {"type": "string", "description": "New name for the page"},
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
-        },
-        "required": ["newName"] # newName is always required
-    }
-)
-
-coda_peek_page_func = FunctionDeclaration(
-    name="coda_peek_page",
-    description="Returns the first few lines of a Coda page as markdown. Requires either pageId or pageName. Optionally, specify the number of lines to peek. If using pageName, you should also provide documentId or documentName for disambiguation.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pageId": {"type": "string", "description": "The page ID"},
-            "pageName": {"type": "string", "description": "The page name"},
-            "numLines": {"type": "integer", "description": "Number of lines to peek (default: 5)"},
-            "documentId": {"type": "string", "description": "The document ID"},
-            "documentName": {"type": "string", "description": "The document name"}
+    ),
+    FunctionDeclaration(
+        name="coda_get_page_content",
+        description="Retrieves the complete content of a Coda page as markdown.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pageIdOrName": {"type": "string", "description": "The page ID or page name"},
+                "docId": {"type": "string", "description": "The document ID (required)"}
+            },
+            "required": ["pageIdOrName", "docId"]
         }
-    }
-)
-
-# Create the tools object (a single Tool containing multiple FunctionDeclarations)
-coda_tools = Tool(function_declarations=[
-    coda_list_documents_func,
-    coda_list_pages_func,
-    coda_create_page_func,
-    coda_get_page_content_func,
-    coda_replace_page_content_func,
-    coda_append_page_content_func,
-    coda_duplicate_page_func,
-    coda_rename_page_func,
-    coda_peek_page_func
-])
-
-# --- Tool execution functions (Python wrappers) ---
-# These functions will be called by your Python script based on Gemini's suggestions.
-# Their names must match the 'name' in FunctionDeclaration.
-
-def coda_list_documents():
-    """Wrapper for the coda_list_documents MCP tool."""
-    return execute_mcp_tool("coda_list_documents")
-
-def coda_list_pages(documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_list_pages MCP tool.
-    Adds validation for documentId or documentName.
-    """
-    if not documentId and not documentName:
-        return {"error": "coda_list_pages: Either documentId or documentName must be provided."}
-    return execute_mcp_tool("coda_list_pages", documentId=documentId, documentName=documentName)
-
-def coda_create_page(documentId: str = None, documentName: str = None, pageName: str = None, content: str = "", parentPageId: str = None):
-    """
-    Wrapper for the coda_create_page MCP tool.
-    Adds validation for pageName and documentId/documentName.
-    """
-    if not pageName:
-        return {"error": "coda_create_page: 'pageName' is required."}
-    if not documentId and not documentName:
-        return {"error": "coda_create_page: Either documentId or documentName must be provided."}
-    
-    # MCP expects 'name' for page name, not 'pageName' in some contexts, adjust here.
-    return execute_mcp_tool("coda_create_page", documentId=documentId, documentName=documentName, name=pageName, content=content, parentPageId=parentPageId)
-
-def coda_get_page_content(pageId: str = None, pageName: str = None, documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_get_page_content MCP tool.
-    Adds validation for pageId or pageName.
-    """
-    if not pageId and not pageName:
-        return {"error": "coda_get_page_content: Either pageId or pageName must be provided."}
-    return execute_mcp_tool("coda_get_page_content", pageId=pageId, pageName=pageName, documentId=documentId, documentName=documentName)
-
-def coda_replace_page_content(pageId: str = None, pageName: str = None, content: str = None, documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_replace_page_content MCP tool.
-    Adds validation for content and pageId/pageName.
-    """
-    if content is None: # Explicitly check for None, empty string is valid content
-        return {"error": "coda_replace_page_content: 'content' is required."}
-    if not pageId and not pageName:
-        return {"error": "coda_replace_page_content: Either pageId or pageName must be provided."}
-    return execute_mcp_tool("coda_replace_page_content", pageId=pageId, pageName=pageName, content=content, documentId=documentId, documentName=documentName)
-
-def coda_append_page_content(pageId: str = None, pageName: str = None, content: str = None, documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_append_page_content MCP tool.
-    Adds validation for content and pageId/pageName.
-    """
-    if content is None: # Explicitly check for None, empty string is valid content
-        return {"error": "coda_append_page_content: 'content' is required."}
-    if not pageId and not pageName:
-        return {"error": "coda_append_page_content: Either pageId or pageName must be provided."}
-    return execute_mcp_tool("coda_append_page_content", pageId=pageId, pageName=pageName, content=content, documentId=documentId, documentName=documentName)
-
-def coda_duplicate_page(pageId: str = None, pageName: str = None, newPageName: str = None, documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_duplicate_page MCP tool.
-    Adds validation for newPageName and pageId/pageName.
-    """
-    if not newPageName:
-        return {"error": "coda_duplicate_page: 'newPageName' is required."}
-    if not pageId and not pageName:
-        return {"error": "coda_duplicate_page: Either pageId or pageName must be provided."}
-    return execute_mcp_tool("coda_duplicate_page", pageId=pageId, pageName=pageName, newPageName=newPageName, documentId=documentId, documentName=documentName)
-
-def coda_rename_page(pageId: str = None, pageName: str = None, newName: str = None, documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_rename_page MCP tool.
-    Adds validation for newName and pageId/pageName.
-    """
-    if not newName:
-        return {"error": "coda_rename_page: 'newName' is required."}
-    if not pageId and not pageName:
-        return {"error": "coda_rename_page: Either pageId or pageName must be provided."}
-    return execute_mcp_tool("coda_rename_page", pageId=pageId, pageName=pageName, newName=newName, documentId=documentId, documentName=documentName)
-
-def coda_peek_page(pageId: str = None, pageName: str = None, numLines: int = 5, documentId: str = None, documentName: str = None):
-    """
-    Wrapper for the coda_peek_page MCP tool.
-    Adds validation for pageId or pageName.
-    """
-    if not pageId and not pageName:
-        return {"error": "coda_peek_page: Either pageId or pageName must be provided."}
-    return execute_mcp_tool("coda_peek_page", pageId=pageId, pageName=pageName, numLines=numLines, documentId=documentId, documentName=documentName)
-
-# --- Streamlit UI ---
-
-def main():
-    st.set_page_config(
-        page_title="Coda Agent Chat",
-        page_icon="📋",
-        layout="wide"
+    ),
+    FunctionDeclaration(
+        name="coda_replace_page_content",
+        description="Completely replaces a page's content with new markdown.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pageIdOrName": {"type": "string", "description": "The page ID or page name"},
+                "content": {"type": "string", "description": "New markdown content"},
+                "docId": {"type": "string", "description": "The document ID (required)"}
+            },
+            "required": ["pageIdOrName", "content", "docId"]
+        }
+    ),
+    FunctionDeclaration(
+        name="coda_append_page_content",
+        description="Adds new markdown content to the end of a Coda page.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pageIdOrName": {"type": "string", "description": "The page ID or page name"},
+                "content": {"type": "string", "description": "Markdown content to append"},
+                "docId": {"type": "string", "description": "The document ID (required)"}
+            },
+            "required": ["pageIdOrName", "content", "docId"]
+        }
+    ),
+    FunctionDeclaration(
+        name="coda_peek_page",
+        description="Returns the first few lines of a Coda page as markdown.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pageIdOrName": {"type": "string", "description": "The page ID or page name"},
+                "numLines": {"type": "integer", "description": "Number of lines to peek (default: 5)"},
+                "docId": {"type": "string", "description": "The document ID (required)"}
+            },
+            "required": ["pageIdOrName", "docId"]
+        }
+    ),
+    FunctionDeclaration(
+        name="coda_duplicate_page",
+        description="Creates a copy of an existing page with a new name.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pageIdOrName": {"type": "string", "description": "The ID or name of the page to duplicate"},
+                "newName": {"type": "string", "description": "The name for the new duplicated page"},
+                "docId": {"type": "string", "description": "The document ID (required)"}
+            },
+            "required": ["pageIdOrName", "newName", "docId"]
+        }
+    ),
+    FunctionDeclaration(
+        name="coda_rename_page",
+        description="Renames an existing page.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pageIdOrName": {"type": "string", "description": "The ID or name of the page to rename"},
+                "newName": {"type": "string", "description": "The new name for the page"},
+                "docId": {"type": "string", "description": "The document ID (required)"}
+            },
+            "required": ["pageIdOrName", "newName", "docId"]
+        }
+    ),
+    FunctionDeclaration(
+        name="coda_resolve_link",
+        description="Resolves metadata given a browser link to a Coda object.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The Coda URL to resolve"}
+            },
+            "required": ["url"]
+        }
     )
-    
-    st.title("🤖 Coda Agent Chat")
-    st.markdown("Chat with an AI agent that can interact with your Coda documents!")
-    
-    # Initialize session state
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'chat' not in st.session_state:
-        st.session_state.chat = None
-    if 'server_started' not in st.session_state:
-        st.session_state.server_started = False
-    
-    # Sidebar for server management
-    with st.sidebar:
-        st.header("🔧 Server Management")
+]
+
+coda_tools = Tool(function_declarations=coda_tools_declarations)
+
+# Tool execution functions
+available_tool_functions = {
+    "coda_list_documents": lambda: execute_mcp_tool("coda_list_documents"),
+    "coda_list_pages": lambda **kwargs: execute_mcp_tool("coda_list_pages", **kwargs),
+    "coda_create_page": lambda **kwargs: execute_mcp_tool("coda_create_page", **kwargs),
+    "coda_get_page_content": lambda **kwargs: execute_mcp_tool("coda_get_page_content", **kwargs),
+    "coda_replace_page_content": lambda **kwargs: execute_mcp_tool("coda_replace_page_content", **kwargs),
+    "coda_append_page_content": lambda **kwargs: execute_mcp_tool("coda_append_page_content", **kwargs),
+    "coda_peek_page": lambda **kwargs: execute_mcp_tool("coda_peek_page", **kwargs),
+    "coda_duplicate_page": lambda **kwargs: execute_mcp_tool("coda_duplicate_page", **kwargs),
+    "coda_rename_page": lambda **kwargs: execute_mcp_tool("coda_rename_page", **kwargs),
+    "coda_resolve_link": lambda **kwargs: execute_mcp_tool("coda_resolve_link", **kwargs)
+}
+
+def save_session(session_name, messages):
+    """Save chat session to file"""
+    session_file = SESSIONS_DIR / f"{session_name}.pkl"
+    with open(session_file, 'wb') as f:
+        pickle.dump({
+            'messages': messages,
+            'timestamp': datetime.now(),
+            'session_name': session_name
+        }, f)
+
+def load_session(session_name):
+    """Load chat session from file"""
+    session_file = SESSIONS_DIR / f"{session_name}.pkl"
+    if session_file.exists():
+        with open(session_file, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+def get_available_sessions():
+    """Get list of available session files"""
+    sessions = []
+    for session_file in SESSIONS_DIR.glob("*.pkl"):
+        try:
+            with open(session_file, 'rb') as f:
+                session_data = pickle.load(f)
+                sessions.append({
+                    'name': session_data['session_name'],
+                    'timestamp': session_data['timestamp'],
+                    'message_count': len(session_data['messages'])
+                })
+        except:
+            continue
+    return sorted(sessions, key=lambda x: x['timestamp'], reverse=True)
+
+def initialize_model():
+    """Initialize the Gemini model"""
+    try:
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            st.error("GOOGLE_API_KEY environment variable not set.")
+            return None
         
-        if not st.session_state.server_started:
-            if st.button("🚀 Start MCP Server", type="primary"):
-                with st.spinner("Starting MCP server..."):
-                    if start_mcp_server():
-                        st.session_state.server_started = True
-                        st.session_state.chat = model.start_chat()
-                        st.success("MCP server started successfully!")
-                        st.rerun()
-                    else:
-                        st.error("Failed to start MCP server")
-        else:
-            st.success("✅ MCP Server is running")
-            if st.button("🛑 Stop MCP Server", type="secondary"):
-                stop_mcp_server()
-                st.session_state.server_started = False
-                st.session_state.chat = None
-                st.info("MCP server stopped")
-                st.rerun()
-        
-        st.divider()
-        
-        # Available tools info
-        st.header("🛠️ Available Tools")
-        tools_info = [
-            "📋 List Documents",
-            "📄 List Pages",
-            "➕ Create Page",
-            "📖 Get Page Content",
-            "✏️ Replace Page Content",
-            "📝 Append Page Content",
-            "📋 Duplicate Page",
-            "🏷️ Rename Page",
-            "👀 Peek Page"
-        ]
-        for tool in tools_info:
-            st.markdown(f"• {tool}")
-        
-        st.divider()
-        
-        if st.button("🗑️ Clear Chat History"):
-            st.session_state.messages = []
-            if st.session_state.server_started:
-                st.session_state.chat = model.start_chat()
-            st.rerun()
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-pro')
+        return model
+    except Exception as e:
+        st.error(f"Error initializing model: {e}")
+        return None
+
+def process_message(user_input):
+    """Process user message and get AI response"""
+    if not st.session_state.model:
+        st.session_state.model = initialize_model()
+        if not st.session_state.model:
+            return "Error: Could not initialize the AI model."
     
-    # Main chat interface
-    if not st.session_state.server_started:
-        st.warning("⚠️ Please start the MCP server first using the sidebar.")
-        st.info("💡 Make sure you have set the GOOGLE_API_KEY environment variable and have Node.js/npm installed.")
-        return
+    # Start chat session if not exists
+    if not st.session_state.chat_session:
+        st.session_state.chat_session = st.session_state.model.start_chat()
     
-    # Create dictionary to map tool names to their corresponding Python functions
-    available_tool_functions = {
-        "coda_list_documents": coda_list_documents,
-        "coda_list_pages": coda_list_pages,
-        "coda_create_page": coda_create_page,
-        "coda_get_page_content": coda_get_page_content,
-        "coda_replace_page_content": coda_replace_page_content,
-        "coda_append_page_content": coda_append_page_content,
-        "coda_duplicate_page": coda_duplicate_page,
-        "coda_rename_page": coda_rename_page,
-        "coda_peek_page": coda_peek_page
-    }
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "user":
-                st.markdown(message["content"])
-            else:
-                if "tool_calls" in message:
-                    # Display tool calls
-                    for tool_call in message["tool_calls"]:
-                        with st.expander(f"🔧 Tool Call: {tool_call['name']}"):
-                            st.code(json.dumps(tool_call["args"], indent=2), language="json")
-                            if "output" in tool_call:
-                                st.markdown("**Output:**")
-                                if isinstance(tool_call["output"], dict):
-                                    st.json(tool_call["output"])
-                                else:
-                                    st.markdown(str(tool_call["output"]))
+    try:
+        # Send message to AI
+        response = st.session_state.chat_session.send_message(user_input, tools=[coda_tools])
+        
+        # Process response and handle function calls
+        response_text = ""
+        
+        while True:
+            if not response.candidates:
+                response_text = "No response from AI."
+                break
+
+            candidate_content = response.candidates[0].content
+            if not candidate_content:
+                response_text = "No content in AI response."
+                break
+
+            function_calls_found = []
+            text_parts_found = []
+
+            for part in candidate_content.parts:
+                if hasattr(part, 'function_call') and part.function_call:
+                    function_calls_found.append(part.function_call)
+                if hasattr(part, 'text') and part.text:
+                    text_parts_found.append(part.text)
+
+            if function_calls_found:
+                function_responses = []
+                for function_call in function_calls_found:
+                    tool_name = function_call.name
+                    tool_args = dict(function_call.args)
+                    
+                    if tool_name in available_tool_functions:
+                        try:
+                            tool_output = available_tool_functions[tool_name](**tool_args)
+                            if not isinstance(tool_output, (dict, str)):
+                                tool_output = str(tool_output)
+                            
+                            function_responses.append(genai.protos.Part(
+                                function_response=genai.protos.FunctionResponse(
+                                    name=tool_name,
+                                    response=tool_output
+                                )
+                            ))
+                        except Exception as e:
+                            error_message = f"Error executing tool {tool_name}: {e}"
+                            function_responses.append(genai.protos.Part(
+                                function_response=genai.protos.FunctionResponse(
+                                    name=tool_name,
+                                    response={"error": error_message}
+                                )
+                            ))
                 
-                if "content" in message:
-                    st.markdown(message["content"])
+                response = st.session_state.chat_session.send_message(function_responses)
+            elif text_parts_found:
+                response_text = "".join(text_parts_found)
+                break
+            else:
+                response_text = "I received a response but couldn't interpret it."
+                break
+        
+        return response_text
     
-    # Chat input
-    if prompt := st.chat_input("Ask me anything about your Coda documents..."):
+    except Exception as e:
+        return f"Error processing message: {e}"
+
+# Streamlit UI
+def main():
+    st.title("🤖 Coda AI Assistant")
+    st.markdown("Your intelligent assistant for managing Coda documents and pages")
+    
+    # Sidebar for session management
+    with st.sidebar:
+        st.header("📋 Session Management")
+        
+        # Current session info
+        st.write(f"**Current Session:** {st.session_state.session_name}")
+        st.write(f"**Messages:** {len(st.session_state.messages)}")
+        
+        # New session button
+        if st.button("🆕 New Session"):
+            # Save current session if it has messages
+            if st.session_state.messages:
+                save_session(st.session_state.session_name, st.session_state.messages)
+            
+            # Reset session
+            st.session_state.messages = []
+            st.session_state.chat_session = None
+            st.session_state.session_name = f"Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            st.rerun()
+        
+        # Save current session
+        if st.button("💾 Save Session") and st.session_state.messages:
+            save_session(st.session_state.session_name, st.session_state.messages)
+            st.success("Session saved!")
+        
+        # Load existing sessions
+        st.subheader("📂 Previous Sessions")
+        sessions = get_available_sessions()
+        
+        if sessions:
+            for session in sessions[:10]:  # Show last 10 sessions
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    session_display = f"{session['name'][:20]}..." if len(session['name']) > 20 else session['name']
+                    st.write(f"**{session_display}**")
+                    st.caption(f"{session['message_count']} messages • {session['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                
+                with col2:
+                    if st.button("📁", key=f"load_{session['name']}", help="Load session"):
+                        # Save current session if it has messages
+                        if st.session_state.messages:
+                            save_session(st.session_state.session_name, st.session_state.messages)
+                        
+                        # Load selected session
+                        session_data = load_session(session['name'])
+                        if session_data:
+                            st.session_state.messages = session_data['messages']
+                            st.session_state.session_name = session_data['session_name']
+                            st.session_state.chat_session = None  # Reset chat session
+                            st.rerun()
+        else:
+            st.write("No previous sessions found")
+        
+        # Server status
+        st.subheader("🔧 Server Status")
+        server_status = "🟢 Running" if st.session_state.mcp_server_process else "🔴 Stopped"
+        st.write(f"MCP Server: {server_status}")
+        
+        if st.button("🔄 Restart Server"):
+            stop_mcp_server()
+            if start_mcp_server():
+                st.success("Server restarted!")
+            else:
+                st.error("Failed to restart server")
+        
+        # Available commands
+        st.subheader("📖 Available Commands")
+        st.markdown("""
+        - **List documents**: Show all your Coda documents
+        - **List pages**: Show pages in a document  
+        - **Create page**: Create new pages with content
+        - **Get content**: Retrieve page content
+        - **Update content**: Replace or append to pages
+        - **Manage pages**: Duplicate, rename pages
+        - **Resolve links**: Get info from Coda URLs
+        """)
+    
+    # Main chat interface - Create scrollable chat area
+    st.markdown("### 💬 Chat")
+    
+    # Create a container with fixed height for scrollable chat
+    chat_container = st.container()
+    
+    with chat_container:
+        if st.session_state.messages:
+            # Display all messages in reverse order (newest at bottom)
+            for i, message in enumerate(st.session_state.messages):
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+                    
+            # Add some space at the bottom
+            st.markdown("<br>", unsafe_allow_html=True)
+        else:
+            # Welcome message for new sessions
+            st.markdown("""
+            <div class="welcome-message">
+                <h3>👋 Welcome to your Coda AI Assistant!</h3>
+                <p>I can help you with:</p>
+                <ul>
+                    <li>📋 Listing your Coda documents and pages</li>
+                    <li>✏️ Creating and editing pages</li>
+                    <li>📄 Reading and updating content</li>
+                    <li>🔗 Managing page links and structure</li>
+                </ul>
+                <p><strong>What would you like to do first?</strong></p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Add separator before input
+    st.markdown("---")
+    
+    # Chat input at the bottom - this stays fixed at bottom
+    if prompt := st.chat_input("Type your message here... (e.g., 'List my documents' or 'Create a new page')"):
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Display user message
+        # Show user message immediately
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Generate response
+        # Ensure MCP server is running
+        if not st.session_state.mcp_server_process:
+            with st.spinner("🔄 Starting MCP server..."):
+                start_mcp_server()
+        
+        # Show loading indicator
         with st.chat_message("assistant"):
-            with st.spinner("Agent thinking..."):
-                try:
-                    # Send the message to Gemini with the defined tools
-                    response = st.session_state.chat.send_message(prompt, tools=[coda_tools])
-                    
-                    assistant_message = {"role": "assistant"}
-                    tool_calls_made = []
-                    
-                    # Process Gemini's response
-                    while True:
-                        if not response.candidates:
-                            st.error("No candidates in response from Gemini.")
-                            break
-
-                        candidate_content = response.candidates[0].content
-                        if not candidate_content:
-                            st.error("No content in candidate response from Gemini.")
-                            break
-
-                        function_calls_found = []
-                        text_parts_found = []
-
-                        # Iterate through all parts to find function calls and text
-                        for part in candidate_content.parts:
-                            if hasattr(part, 'function_call') and part.function_call:
-                                function_calls_found.append(part.function_call)
-                            if hasattr(part, 'text') and part.text:
-                                text_parts_found.append(part.text)
-
-                        if function_calls_found:
-                            # If function calls are found, execute them
-                            function_responses = []
-                            for function_call in function_calls_found:
-                                tool_name = function_call.name
-                                tool_args = dict(function_call.args) # Convert to dictionary
-
-                                st.info(f"🔧 Executing tool: **{tool_name}**")
-                                
-                                # Store tool call info
-                                tool_call_info = {
-                                    "name": tool_name,
-                                    "args": tool_args
-                                }
-                                
-                                # Execute the tool
-                                if tool_name in available_tool_functions:
-                                    try:
-                                        tool_output = available_tool_functions[tool_name](**tool_args)
-                                        tool_call_info["output"] = tool_output
-                                        
-                                        # Ensure tool_output is a dictionary or string for FunctionResponse
-                                        if not isinstance(tool_output, (dict, str)):
-                                            tool_output = str(tool_output)
-                                        
-                                        function_responses.append(genai.protos.Part(
-                                            function_response=genai.protos.FunctionResponse(
-                                                name=tool_name,
-                                                response=tool_output
-                                            )
-                                        ))
-                                    except Exception as e:
-                                        error_message = f"Error executing tool {tool_name}: {e}"
-                                        tool_call_info["output"] = {"error": error_message}
-                                        st.error(error_message)
-                                        function_responses.append(genai.protos.Part(
-                                            function_response=genai.protos.FunctionResponse(
-                                                name=tool_name,
-                                                response={"error": error_message}
-                                            )
-                                        ))
-                                else:
-                                    error_message = f"Agent attempted to call unknown tool: {tool_name}"
-                                    tool_call_info["output"] = {"error": error_message}
-                                    st.error(error_message)
-                                    function_responses.append(genai.protos.Part(
-                                        function_response=genai.protos.FunctionResponse(
-                                            name=tool_name,
-                                            response={"error": error_message}
-                                        )
-                                    ))
-                                
-                                tool_calls_made.append(tool_call_info)
-                            
-                            # Send the tool responses back to Gemini for further reasoning
-                            response = st.session_state.chat.send_message(function_responses)
-                        elif text_parts_found:
-                            # If there are text parts and no function calls, it's the final text response
-                            final_response = "".join(text_parts_found)
-                            st.markdown(final_response)
-                            assistant_message["content"] = final_response
-                            break # Exit inner loop, await next user input
-                        else:
-                            # This case should ideally not happen if response.candidates[0].content exists
-                            st.error("I received a response but couldn't interpret it (neither text nor tool calls).")
-                            break # Exit inner loop
-                    
-                    # Add tool calls to assistant message if any were made
-                    if tool_calls_made:
-                        assistant_message["tool_calls"] = tool_calls_made
-                    
-                    # Add assistant message to chat history
-                    st.session_state.messages.append(assistant_message)
-
-                except Exception as e:
-                    st.error(f"An error occurred during agent conversation: {e}")
+            with st.spinner("🤔 Processing your request..."):
+                response = process_message(prompt)
+            st.markdown(response)
+        
+        # Add assistant response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Auto-save session every 10 messages
+        if len(st.session_state.messages) % 10 == 0:
+            save_session(st.session_state.session_name, st.session_state.messages)
+            st.success("💾 Session auto-saved!", icon="✅")
+        
+        # Rerun to update the display
+        st.rerun()
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("💡 **Tips:** Ask me to list your documents, create pages, manage content, or help with any Coda-related tasks!")
 
 if __name__ == "__main__":
+    # Check for required environment variables
+    if not os.environ.get("GOOGLE_API_KEY"):
+        st.error("Please set the GOOGLE_API_KEY environment variable")
+        st.stop()
+    
+    if not os.environ.get("CODA_API_KEY") and not os.environ.get("API_KEY"):
+        st.warning("Please set either CODA_API_KEY or API_KEY environment variable for Coda access")
+    
     main()

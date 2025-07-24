@@ -1,3 +1,4 @@
+
 import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
 import json
@@ -300,6 +301,71 @@ coda_peek_page_func = FunctionDeclaration(
     }
 )
 
+# New FunctionDeclaration for coda_duplicate_page
+coda_duplicate_page_func = FunctionDeclaration(
+    name="coda_duplicate_page",
+    description="Creates a copy of an existing page with a new name. Requires pageIdOrName, newName, and docId.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "pageIdOrName": {
+                "type": "string",
+                "description": "The ID or name of the page to duplicate."
+            },
+            "newName": {
+                "type": "string",
+                "description": "The name for the new duplicated page."
+            },
+            "docId": {
+                "type": "string",
+                "description": "The document ID (required)."
+            }
+        },
+        "required": ["pageIdOrName", "newName", "docId"]
+    }
+)
+
+# New FunctionDeclaration for coda_rename_page
+coda_rename_page_func = FunctionDeclaration(
+    name="coda_rename_page",
+    description="Renames an existing page. Requires pageIdOrName, newName, and docId.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "pageIdOrName": {
+                "type": "string",
+                "description": "The ID or name of the page to rename."
+            },
+            "newName": {
+                "type": "string",
+                "description": "The new name for the page."
+            },
+            "docId": {
+                "type": "string",
+                "description": "The document ID (required)."
+            }
+        },
+        "required": ["pageIdOrName", "newName", "docId"]
+    }
+)
+
+# New FunctionDeclaration for coda_resolve_link
+coda_resolve_link_func = FunctionDeclaration(
+    name="coda_resolve_link",
+    description="Resolves metadata given a browser link to a Coda object. Returns information about the linked object.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The Coda URL to resolve."
+            }
+        },
+        "required": ["url"]
+    }
+)
+
+
 coda_tools = Tool(function_declarations=[
     coda_list_documents_func,
     coda_list_pages_func,
@@ -307,7 +373,10 @@ coda_tools = Tool(function_declarations=[
     coda_get_page_content_func,
     coda_replace_page_content_func,
     coda_append_page_content_func,
-    coda_peek_page_func
+    coda_peek_page_func,
+    coda_duplicate_page_func, # Added
+    coda_rename_page_func,    # Added
+    coda_resolve_link_func    # Added
 ])
 
 def coda_list_documents():
@@ -347,6 +416,21 @@ def coda_peek_page(pageIdOrName: str, docId: str, numLines: int = 5):
     params = {"pageIdOrName": pageIdOrName, "docId": docId, "numLines": numLines}
     return execute_mcp_tool("coda_peek_page", **params)
 
+# New wrapper function for coda_duplicate_page
+def coda_duplicate_page(pageIdOrName: str, newName: str, docId: str):
+    params = {"pageIdOrName": pageIdOrName, "newName": newName, "docId": docId}
+    return execute_mcp_tool("coda_duplicate_page", **params)
+
+# New wrapper function for coda_rename_page
+def coda_rename_page(pageIdOrName: str, newName: str, docId: str):
+    params = {"pageIdOrName": pageIdOrName, "newName": newName, "docId": docId}
+    return execute_mcp_tool("coda_rename_page", **params)
+
+# New wrapper function for coda_resolve_link
+def coda_resolve_link(url: str):
+    params = {"url": url}
+    return execute_mcp_tool("coda_resolve_link", **params)
+
 def run_interactive_agent_chat():
     available_tool_functions = {
         "coda_list_documents": coda_list_documents,
@@ -355,7 +439,10 @@ def run_interactive_agent_chat():
         "coda_get_page_content": coda_get_page_content,
         "coda_replace_page_content": coda_replace_page_content,
         "coda_append_page_content": coda_append_page_content,
-        "coda_peek_page": coda_peek_page
+        "coda_peek_page": coda_peek_page,
+        "coda_duplicate_page": coda_duplicate_page, # Added
+        "coda_rename_page": coda_rename_page,       # Added
+        "coda_resolve_link": coda_resolve_link      # Added
     }
 
     if not start_mcp_server():
@@ -370,6 +457,8 @@ def run_interactive_agent_chat():
     print("- Create, read, update pages")
     print("- Manage page content with markdown")
     print("- Peek at page content")
+    print("- Duplicate and rename pages") # Added
+    print("- Resolve Coda links")          # Added
 
     try:
         while True:
