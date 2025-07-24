@@ -412,6 +412,7 @@ def process_message(user_input):
         
         # Process response and handle function calls
         response_text = ""
+        tool_calls_made = []
         
         while True:
             if not response.candidates:
@@ -437,6 +438,12 @@ def process_message(user_input):
                 for function_call in function_calls_found:
                     tool_name = function_call.name
                     tool_args = dict(function_call.args)
+                    
+                    # Store tool call info for display
+                    tool_calls_made.append({
+                        'name': tool_name,
+                        'args': tool_args
+                    })
                     
                     if tool_name in available_tool_functions:
                         try:
@@ -467,55 +474,100 @@ def process_message(user_input):
                 response_text = "I received a response but couldn't interpret it."
                 break
         
-        return response_text
+        # Format response with tool calls if any were made
+        if tool_calls_made:
+            tool_info = ""
+            for tool_call in tool_calls_made:
+                tool_info += f"🔧 Calling {tool_call['name']} with args: {json.dumps(tool_call['args'], indent=2)}\n\n"
+            
+            return f"{tool_info}{response_text}"
+        else:
+            return response_text
     
     except Exception as e:
         return f"Error processing message: {e}"
 
 # Streamlit UI
 def main():
-    st.title("🤖 Coda AI Assistant")
-    st.markdown("Your intelligent assistant for managing Coda documents and pages")
+    st.title("📝 Coda AI Assistant with Persistent Chat")
     
-    # Sidebar for session management
+    # Sidebar with configuration and session management
     with st.sidebar:
-        st.header("📋 Session Management")
+        # Configuration Section
+        st.markdown("## 🔧 Configuration")
         
-        # Current session info
-        st.write(f"**Current Session:** {st.session_state.session_name}")
-        st.write(f"**Messages:** {len(st.session_state.messages)}")
+        # API Keys Status
+        st.markdown("### API Keys Status")
+        google_key_status = "✅ Google API Key configured" if os.environ.get("GOOGLE_API_KEY") else "❌ Google API Key missing"
+        coda_key_status = "✅ Coda API Key configured" if (os.environ.get("CODA_API_KEY") or os.environ.get("API_KEY")) else "❌ Coda API Key missing"
         
-        # New session button
-        if st.button("🆕 New Session"):
-            # Save current session if it has messages
-            if st.session_state.messages:
-                save_session(st.session_state.session_name, st.session_state.messages)
+        st.markdown(f"{google_key_status}")
+        st.markdown(f"{coda_key_status}")
+        st.markdown("")
+        
+        # MCP Server Status
+        st.markdown("### MCP Server Status")
+        if st.session_state.mcp_server_process and st.session_state.mcp_server_process.poll() is None:
+            st.markdown("🟢 Connected")
+        else:
+            st.markdown("🔴 Disconnected")
             
-            # Reset session
-            st.session_state.messages = []
-            st.session_state.chat_session = None
-            st.session_state.session_name = f"Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            st.rerun()
+        if st.button("🔄 Restart Server", key="restart_server"):
+            stop_mcp_server()
+            with st.spinner("Restarting server..."):
+                if start_mcp_server():
+                    st.success("Server restarted!")
+                    st.rerun()
+                else:
+                    st.error("Failed to restart server")
         
-        # Save current session
-        if st.button("💾 Save Session") and st.session_state.messages:
-            save_session(st.session_state.session_name, st.session_state.messages)
-            st.success("Session saved!")
+        st.markdown("---")
         
-        # Load existing sessions
-        st.subheader("📂 Previous Sessions")
+        # Chat Sessions Section
+        st.markdown("## 💬 Chat Sessions")
+        
+        # Current session info with short ID
+        current_session_id = st.session_state.session_name[-12:] if len(st.session_state.session_name) > 12 else st.session_state.session_name
+        st.markdown(f"**Current:** {current_session_id}")
+        st.markdown("")
+        
+        # Session management buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🆕 New", key="new_session"):
+                # Save current session if it has messages
+                if st.session_state.messages:
+                    save_session(st.session_state.session_name, st.session_state.messages)
+                
+                # Reset session
+                st.session_state.messages = []
+                st.session_state.chat_session = None
+                st.session_state.session_name = f"Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                st.rerun()
+        
+        with col2:
+            if st.button("💾 Save", key="save_session") and st.session_state.messages:
+                save_session(st.session_state.session_name, st.session_state.messages)
+                st.success("Saved!", icon="✅")
+        
+        st.markdown("---")
+        
+        # Saved Sessions Section
+        st.markdown("## 📚 Saved Sessions")
         sessions = get_available_sessions()
         
         if sessions:
-            for session in sessions[:10]:  # Show last 10 sessions
+            # Show sessions in a more compact format
+            for session in sessions[:5]:  # Show last 5 sessions
+                session_id = session['name'][-12:] if len(session['name']) > 12 else session['name']
+                
                 col1, col2 = st.columns([3, 1])
                 with col1:
-                    session_display = f"{session['name'][:20]}..." if len(session['name']) > 20 else session['name']
-                    st.write(f"**{session_display}**")
-                    st.caption(f"{session['message_count']} messages • {session['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                    st.markdown(f"**{session_id}**")
+                    st.caption(f"{session['message_count']} msgs • {session['timestamp'].strftime('%m/%d %H:%M')}")
                 
                 with col2:
-                    if st.button("📁", key=f"load_{session['name']}", help="Load session"):
+                    if st.button("📂", key=f"load_{session['name']}", help="Load session"):
                         # Save current session if it has messages
                         if st.session_state.messages:
                             save_session(st.session_state.session_name, st.session_state.messages)
@@ -527,32 +579,33 @@ def main():
                             st.session_state.session_name = session_data['session_name']
                             st.session_state.chat_session = None  # Reset chat session
                             st.rerun()
+            
+            if len(sessions) > 5:
+                st.caption(f"+ {len(sessions) - 5} more sessions")
         else:
-            st.write("No previous sessions found")
+            st.markdown("No saved sessions found")
         
-        # Server status
-        st.subheader("🔧 Server Status")
-        server_status = "🟢 Running" if st.session_state.mcp_server_process else "🔴 Stopped"
-        st.write(f"MCP Server: {server_status}")
+        st.markdown("---")
         
-        if st.button("🔄 Restart Server"):
-            stop_mcp_server()
-            if start_mcp_server():
-                st.success("Server restarted!")
-            else:
-                st.error("Failed to restart server")
+        # Available Commands Section
+        st.markdown("## 📋 Available Commands")
         
-        # Available commands
-        st.subheader("📖 Available Commands")
-        st.markdown("""
-        - **List documents**: Show all your Coda documents
-        - **List pages**: Show pages in a document  
-        - **Create page**: Create new pages with content
-        - **Get content**: Retrieve page content
-        - **Update content**: Replace or append to pages
-        - **Manage pages**: Duplicate, rename pages
-        - **Resolve links**: Get info from Coda URLs
-        """)
+        commands = [
+            ("List documents", '"Show me all my Coda documents"'),
+            ("List pages", '"List pages in document X"'),
+            ("Create page", '"Create a new page called Y in document X"'),
+            ("Read content", '"Show me the content of page Z"'),
+            ("Update content", '"Replace the content of page Z with..."'),
+            ("Append content", '"Add this content to page Z..."'),
+            ("Peek at page", '"Show me the first few lines of page Z"')
+        ]
+        
+        for cmd, example in commands:
+            st.markdown(f"**{cmd}:** {example}")
+            st.markdown("")
+        
+        st.markdown("---")
+        st.markdown("*📝 Coda AI Assistant with Persistent Chat*")
     
     # Main chat interface - Create scrollable chat area
     st.markdown("### 💬 Chat")
